@@ -62,6 +62,8 @@ function compileRule(rule) {
 	
 	currentLineNb = rule.lineStart;
 	currentColNb = 1;
+
+	var ifIndentStack = [];
 	var result = "";
 	
 	if (currentArrayElementNames.length !== 0) {
@@ -200,13 +202,30 @@ function compileRule(rule) {
 					result += tabLevel(1)+tows("_actions", ruleKw)+" {\n";
 					isInActions = true;
 				}
+
+				
+				var lastIfIndent = null;
+				if (ifIndentStack[ifIndentStack.length - 1] >= rule.lines[i].indentLevel) {
+					lastIfIndent = ifIndentStack.pop()
+				}
 				
 				//Check for "if"
-				if (rule.lines[i].tokens[0].text === "if") {
+				if (rule.lines[i].tokens[0].text === "if" || rule.lines[i].tokens[0].text === "elif" || rule.lines[i].tokens[0].text === "else") {
 					if (rule.lines[i].tokens[rule.lines[i].tokens.length-1].text !== ':') {
-						error("If statement must end with ':'");
+						error("If/else/elif statements must end with ':'");
+					}
+
+					// Ensure `else` and `elif` always follow an `if or another `elif`
+					if (rule.lines[i].tokens[0].text !== "if" && lastIfIndent === null) {
+						error("Found " + rule.lines[i].tokens[0].text + " statement without matching if");
+					}
+
+					// Track the current if-indent level only for `if` and `elif`
+					if (rule.lines[i].tokens[0].text !== "else") {
+						ifIndentStack.push(rule.lines[i].indentLevel)
 					}
 					
+					var hasCondition = rule.lines[i].tokens[0].text !== "else";
 					var isSkipIf = true;
 					var isConditionTrueCheck = false;
 					var isConditionFalseCheck = false;
@@ -232,9 +251,10 @@ function compileRule(rule) {
 							var label = rule.lines[i+1].tokens[1].text;
 							var labelOffset = 0;
 							var foundLabel = false;
-							for (var j = i+1; j < rule.lines.length; j++) {
-								if (lineIsInstruction(rule.lines[j].tokens, rule.lines[j-1].tokens[0].text === "if")) {
-									labelOffset++;
+							for (var j = i+2; j < rule.lines.length; j++) {
+								var lineInfo = getLineInstructionLengthInfo(rule.lines, j)
+								if (lineInfo.instruction + lineInfo.precedingSkip) {
+									labelOffset += lineInfo.instruction + lineInfo.precedingSkip
 								} else if (rule.lines[j].tokens[0].text === label) {
 									foundLabel = true;
 									if (rule.lines[j].tokens.length !== 2 || rule.lines[j].tokens[1].text !== ':') {
@@ -275,61 +295,103 @@ function compileRule(rule) {
 						//Check how much instructions there is after the "if" (do not count gotos or lbls)
 						var nbInstructionsIf = 0;
 						var ifIndent = rule.lines[i].indentLevel;
-						var reachedEndOfRule = true;
-						var j = i+1;
-						for (; j < rule.lines.length; j++) {
+						for (var j = i+1; j < rule.lines.length; j++) {
 							if (rule.lines[j].indentLevel > ifIndent) {
-								if (lineIsInstruction(rule.lines[j].tokens, rule.lines[j-1].tokens[0].text === "if")) {
-									nbInstructionsIf++;
-								}
+								var lineInfo = getLineInstructionLengthInfo(rule.lines, j)
+								nbInstructionsIf += lineInfo.instruction + lineInfo.precedingSkip
 							} else {
-								reachedEndOfRule = false;
+								if (rule.lines[j].indentLevel === ifIndent && (rule.lines[j].tokens[0].text === "else" || rule.lines[j].tokens[0].text === "elif")) {
+									var lineInfo = getLineInstructionLengthInfo(rule.lines, j)
+									nbInstructionsIf += lineInfo.precedingSkip
+								}
 								break;
 							}
 						}
 						
-						if (reachedEndOfRule) {
-							isSkipIf = false;
-							invertCondition = true;
-						} else {
-							skipIfOffset = nbInstructionsIf;
-							if (skipIfOffset <= 0) {
-								error("If instruction must have at least one sub-instruction");
-							}
-							invertCondition = true;
+						skipIfOffset = nbInstructionsIf;
+
+						if (skipIfOffset <= 0) {
+							error("If instruction must have at least one sub-instruction");
 						}
+						
+						invertCondition = true;
 					}
+
+					var curLineInfo = getLineInstructionLengthInfo(rule.lines, i)
+					if (
+						rule.lines[i].tokens[0].text !== "if" && curLineInfo.precedingSkip) {
+						var nbInstructionsIf = curLineInfo.instruction;
+						var ifIndent = rule.lines[i].indentLevel;
+						for (var j = i+1; j < rule.lines.length; j++) {
+							if (rule.lines[j].indentLevel > ifIndent || (rule.lines[j].indentLevel === ifIndent && (rule.lines[j].tokens[0].text === "else" || rule.lines[j].tokens[0].text === "elif"))) {
+								var lineInfo = getLineInstructionLengthInfo(rule.lines, j)
+								nbInstructionsIf += lineInfo.instruction + lineInfo.precedingSkip
+							} else {
+								break;
+							}
+						}
+						result += tabLevel(2);
+						result += tows("_skip", actionKw) + "(";
+						result += nbInstructionsIf;
+						result += ");\n";
+					}
+
+					var preventOutput = false;
+					var hasArgs = true
+
+					var ifResult = "";
+
+					ifResult += tabLevel(2);
 					
-					result += tabLevel(2);
 					if (isSkipIf) {
-						result += tows("_skipIf", actionKw);
+						if (hasCondition || (!hasCondition && hasGoto)) {
+							ifResult += tows(hasCondition ? "_skipIf" : "_skip", actionKw);
+						} else {
+							preventOutput = true;
+						}
 					} else if (isConditionTrueCheck) {
 						if (hasAbort) {
-							result += tows("_abortIfConditionIsTrue", actionKw);
+							ifResult += tows("_abortIfConditionIsTrue", actionKw);
 						} else if (hasContinue) {
-							result += tows("_loopIfConditionIsTrue", actionKw);
+							ifResult += tows("_loopIfConditionIsTrue", actionKw);
 						}
 					} else if (isConditionFalseCheck) {
 						if (hasAbort) {
-							result += tows("_abortIfConditionIsFalse", actionKw);
+							ifResult += tows("_abortIfConditionIsFalse", actionKw);
 						} else if (hasContinue) {
-							result += tows("_loopIfConditionIsFalse", actionKw);
+							ifResult += tows("_loopIfConditionIsFalse", actionKw);
 						}
 					} else if (hasContinue) {
-						result += tows("_loopIf", actionKw);
+						ifResult += tows(hasCondition ? "_loopIf" : "_loop", actionKw);
+						hasArgs = hasCondition
 					} else if (hasAbort) {
-						result += tows("_abortIf", actionKw);
+						ifResult += tows(hasCondition ? "_abortIf" : "return", actionKw);
+						hasArgs = hasCondition
 					} else {
 						error("weird if");
 					}
-					result += "(";
-					if (!isConditionTrueCheck && !isConditionFalseCheck) {
-						result += parse(rule.lines[i].tokens.slice(1, rule.lines[i].tokens.length-1), {"isWholeInstruction":true, "invertCondition":invertCondition});
+
+					if (hasArgs) {
+						ifResult += "(";
+
+						if (hasCondition && !isConditionTrueCheck && !isConditionFalseCheck) {
+							ifResult += parse(rule.lines[i].tokens.slice(1, rule.lines[i].tokens.length-1), {"isWholeInstruction":true, "invertCondition":invertCondition});
+						}
+						if (isSkipIf) {
+							if (hasCondition) {
+								ifResult += ", "
+							}
+							ifResult += skipIfOffset;
+						}
+
+						ifResult += ")"
 					}
-					if (isSkipIf) {
-						result += ", "+skipIfOffset;
+
+					ifResult += ";\n";
+					
+					if (!preventOutput) {
+						result += ifResult
 					}
-					result += ");\n";
 					if (hasGoto || hasAbort || hasContinue) {
 						i++;
 					}
@@ -363,6 +425,9 @@ function compileRule(rule) {
 					
 				//Check for "while"
 				} else if (rule.lines[i].tokens[0].text === "while") {
+					if (rule.lines[i].tokens[rule.lines[i].tokens.length - 1].text === ":") {
+						error("While loops not allowed. Use do-while instead.")
+					}
 					result += tabLevel(2);
 					if (rule.lines[i].tokens[1].text === "true" && rule.lines[i].tokens.length === 2) {
 						result += tows("_loop", actionKw);
@@ -395,8 +460,9 @@ function compileRule(rule) {
 						var labelOffset = 0;
 						var foundLabel = false;
 						for (var j = i+1; j < rule.lines.length; j++) {
-							if (lineIsInstruction(rule.lines[j].tokens, rule.lines[j-1].tokens[0].text === "if")) {
-								labelOffset++;
+							var lineInfo = getLineInstructionLengthInfo(rule.lines, j)
+							if (lineInfo.instruction + lineInfo.precedingSkip) {
+								labelOffset += lineInfo.instruction + lineInfo.precedingSkip
 							} else if (rule.lines[j].tokens[0].text === label) {
 								foundLabel = true;
 								if (rule.lines[j].tokens.length !== 2 || rule.lines[j].tokens[1].text !== ':') {
