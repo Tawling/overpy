@@ -1596,9 +1596,11 @@ function tokenize(content) {
 								
 			} else {
 				//Test each macro
+				var foundMacro = false;
 				for (var j = 0; j < macros.length; j++) {
 					if (content.startsWith(macros[j].name, i)) {
-						
+
+						foundMacro = true;
 						
 						var text;
 						var replacement;
@@ -1632,6 +1634,11 @@ function tokenize(content) {
 						
 						j = 0;
 					}
+				}
+
+				if (foundMacro) {
+					i--;
+					continue;
 				}
 				
 				//Get token
